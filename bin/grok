@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# Wrapper installed on PATH so any new interactive Grok TUI gets a
+# zero-padding terminal, not only launches from the bar button.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+real_grok() {
+  local self cand
+  self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+  if [[ -n ${OMARCHY_GROK_BIN:-} && -x $OMARCHY_GROK_BIN ]]; then
+    echo "$OMARCHY_GROK_BIN"
+    return
+  fi
+  IFS=: read -ra dirs <<<"${PATH:-}"
+  for dir in "${dirs[@]}"; do
+    cand="${dir}/grok"
+    [[ -x $cand ]] || continue
+    [[ $(readlink -f "$cand" 2>/dev/null || echo "$cand") == "$self" ]] && continue
+    echo "$cand"
+    return
+  done
+  for cand in "${HOME}/.grok/bin/grok" /usr/bin/grok; do
+    [[ -x $cand ]] && echo "$cand" && return
+  done
+  return 1
+}
+
+GROK_BIN="$(real_grok || true)"
+if [[ -z ${GROK_BIN:-} ]]; then
+  echo "grok is not installed" >&2
+  exit 1
+fi
+
+# Already inside a padless Grok window, or a nested helper.
+if [[ ${GROK_PADLESS:-} == 1 ]]; then
+  exec "$GROK_BIN" "$@"
+fi
+
+passthrough=0
+if [[ ! -t 0 || ! -t 1 ]]; then
+  passthrough=1
+fi
+
+case "${1:-}" in
+  "" | dashboard | -c | --continue | -r | --resume | --fork-session)
+    ;;
+  -h | --help | -v | --version | -p | --single | --prompt-file | --prompt-json)
+    passthrough=1
+    ;;
+  agent | completions | doctor | du | disk-usage | export | help | inspect | \
+  leader | login | logout | mcp | memory | models | plugin | sessions | setup | \
+  trace | update | version | worktree | wrap)
+    passthrough=1
+    ;;
+esac
+
+if [[ $passthrough == 1 ]]; then
+  exec "$GROK_BIN" "$@"
+fi
+
+exec "${SCRIPT_DIR}/omarchy-grok-term" --cwd "$PWD" -- "$@"

@@ -1,0 +1,764 @@
+#!/usr/bin/python3
+# omarchy:summary=List live Grok sessions as JSON for the bar plugin
+"""Emit live Grok TUI sessions: titles, agent counts, and Hyprland windows."""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+
+def grok_home() -> Path:
+  return Path(os.environ.get("GROK_HOME") or (Path.home() / ".grok")).expanduser()
+
+
+def read_json(path: Path) -> Any:
+  try:
+    return json.loads(path.read_text(encoding="utf-8"))
+  except Exception:
+    return None
+
+
+def pid_alive(pid: int) -> bool:
+  return pid > 0 and Path(f"/proc/{pid}").is_dir()
+
+
+def ancestor_pids(pid: int) -> set[int]:
+  seen: set[int] = set()
+  current = pid
+  while current > 1 and current not in seen:
+    seen.add(current)
+    try:
+      stat = Path(f"/proc/{current}/stat").read_text()
+      close = stat.rfind(")")
+      current = int(stat[close + 2 :].split()[1])
+    except Exception:
+      break
+  return seen
+
+
+def hypr_clients() -> list[dict[str, Any]]:
+  try:
+    raw = subprocess.check_output(["hyprctl", "clients", "-j"], text=True, timeout=2)
+    data = json.loads(raw)
+    return data if isinstance(data, list) else []
+  except Exception:
+    return []
+
+
+def window_for_pid(pid: int, clients: list[dict[str, Any]]) -> dict[str, Any] | None:
+  ancestors = ancestor_pids(pid)
+  for client in clients:
+    try:
+      client_pid = int(client.get("pid") or 0)
+    except Exception:
+      continue
+    if client_pid in ancestors:
+      return client
+  return None
+
+
+def session_dir(home: Path, session_id: str, cwd: str) -> Path | None:
+  sessions = home / "sessions"
+  if not sessions.is_dir():
+    return None
+  direct = list(sessions.glob(f"*/{session_id}"))
+  if direct:
+    return direct[0]
+  for summary in sessions.rglob("summary.json"):
+    if summary.parent.name == session_id:
+      return summary.parent
+  return None
+
+
+def format_tokens(count: int) -> str:
+  if count >= 1_000_000:
+    value = count / 1_000_000
+    text = f"{value:.1f}M"
+    return text.replace(".0M", "M")
+  if count >= 1000:
+    return f"{round(count / 1000)}k"
+  return str(count)
+
+
+def is_stub_session(folder: Path | None, summary: dict[str, Any], title: str) -> bool:
+  if title:
+    return False
+  if as_int(summary.get("num_messages")) > 0:
+    return False
+  if folder is not None and (folder / "signals.json").is_file():
+    return False
+  events = parse_events(folder) if folder is not None else {}
+  if events.get("turnOpen") or events.get("lastOutcome"):
+    return False
+  return True
+
+
+def as_int(value: Any) -> int:
+  try:
+    return max(0, int(value or 0))
+  except (TypeError, ValueError):
+    return 0
+
+
+def context_fields(used: Any, limit: Any, percent_hint: Any = None) -> dict[str, Any]:
+  tokens = as_int(used)
+  window = as_int(limit)
+  percent = 0.0
+  if isinstance(percent_hint, (int, float)) and float(percent_hint) > 0:
+    percent = float(percent_hint)
+    if percent <= 1 and window > 0:
+      percent *= 100
+  elif window > 0 and tokens > 0:
+    percent = tokens * 100.0 / window
+  percent = max(0.0, min(100.0, percent))
+  if window > 0:
+    label = f"{format_tokens(tokens)} / {format_tokens(window)}"
+  else:
+    label = format_tokens(tokens)
+  return {
+    "tokens": tokens,
+    "tokensLabel": format_tokens(tokens),
+    "contextLimit": window,
+    "contextPercent": int(round(percent)),
+    "contextLabel": label,
+  }
+
+
+def parse_events(folder: Path) -> dict[str, Any]:
+  state = {
+    "turnOpen": False,
+    "pendingPermissions": 0,
+    "openTools": 0,
+    "lastOutcome": "",
+    "askPending": False,
+  }
+  events_path = folder / "events.jsonl"
+  if not events_path.is_file():
+    return state
+  try:
+    with events_path.open("r", encoding="utf-8", errors="replace") as handle:
+      for line in handle:
+        if '"type":"phase_changed"' in line and "permission" not in line and "turn_" not in line:
+          continue
+        try:
+          event = json.loads(line)
+        except Exception:
+          continue
+        kind = event.get("type")
+        if kind == "turn_started":
+          state["turnOpen"] = True
+          state["lastOutcome"] = ""
+          state["askPending"] = False
+        elif kind == "turn_ended":
+          state["turnOpen"] = False
+          state["lastOutcome"] = str(event.get("outcome") or "")
+          state["openTools"] = 0
+          state["pendingPermissions"] = 0
+        elif kind == "permission_requested":
+          state["pendingPermissions"] += 1
+        elif kind == "permission_resolved":
+          state["pendingPermissions"] = max(0, state["pendingPermissions"] - 1)
+        elif kind == "tool_started":
+          state["openTools"] += 1
+        elif kind == "tool_completed":
+          state["openTools"] = max(0, state["openTools"] - 1)
+        elif kind in ("ask_user", "ask_user_question", "question_requested"):
+          state["askPending"] = True
+        elif kind in ("ask_user_resolved", "question_resolved"):
+          state["askPending"] = False
+  except OSError:
+    pass
+  return state
+
+
+def title_status(title: str) -> str:
+  if not title:
+    return ""
+  first = title[0]
+  if first in "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⋅:⸬⁙":
+    return "active"
+  if first == "○":
+    return "idle"
+  return ""
+
+
+def inhibit_active(pid: int) -> bool:
+  for child in Path("/proc").iterdir():
+    if not child.name.isdigit():
+      continue
+    try:
+      comm = (child / "comm").read_text().strip()
+    except Exception:
+      continue
+    if not comm.startswith("systemd-inhib"):
+      continue
+    try:
+      stat = (child / "stat").read_text()
+      close = stat.rfind(")")
+      ppid = int(stat[close + 2 :].split()[1])
+      cmd = (child / "cmdline").read_text(errors="replace")
+    except Exception:
+      continue
+    if ppid == pid and "turn in progress" in cmd:
+      return True
+  return False
+
+
+def count_active_subagents(folder: Path) -> int:
+  sub = folder / "subagents"
+  if not sub.is_dir():
+    return 0
+  count = 0
+  for child in sub.iterdir():
+    if child.is_dir() or child.suffix == ".json":
+      count += 1
+  return count
+
+
+def session_meta(folder: Path | None, pid: int, window_title: str) -> dict[str, Any]:
+  meta = {
+    "title": "",
+    "model": "",
+    "agents": 0,
+    "tokens": 0,
+    "tokensLabel": "0",
+    "contextLimit": 0,
+    "contextPercent": 0,
+    "contextLabel": "0",
+    "status": "idle",
+    "statusLabel": "Idle",
+    "messageCount": 0,
+    "stub": folder is None,
+  }
+  if folder is None:
+    if inhibit_active(pid) or title_status(window_title) == "active":
+      meta["status"] = "active"
+      meta["statusLabel"] = "Active"
+      meta["agents"] = 1
+    return meta
+
+  summary = read_json(folder / "summary.json")
+  if isinstance(summary, dict):
+    meta["title"] = str(summary.get("generated_title") or summary.get("session_summary") or "").strip()
+    meta["model"] = str(summary.get("current_model_id") or "")
+    meta["messageCount"] = as_int(summary.get("num_messages"))
+    meta["stub"] = is_stub_session(folder, summary, meta["title"])
+
+  signals = read_json(folder / "signals.json")
+  if isinstance(signals, dict):
+    if not meta["model"]:
+      models = signals.get("modelsUsed") or []
+      if isinstance(models, list) and models:
+        meta["model"] = str(models[0])
+    meta.update(
+      context_fields(
+        signals.get("contextTokensUsed"),
+        signals.get("contextWindowTokens"),
+        signals.get("contextWindowUsage"),
+      )
+    )
+
+  events = parse_events(folder)
+  hint = title_status(window_title)
+  if events["pendingPermissions"] > 0 or events["askPending"]:
+    meta["status"] = "waiting"
+    meta["statusLabel"] = "Waiting"
+  elif events["turnOpen"] or events["openTools"] > 0 or inhibit_active(pid) or hint == "active":
+    meta["status"] = "active"
+    meta["statusLabel"] = "Active"
+  elif events["lastOutcome"] in ("error", "failed"):
+    meta["status"] = "error"
+    meta["statusLabel"] = "Error"
+  elif hint == "idle":
+    meta["status"] = "idle"
+    meta["statusLabel"] = "Idle"
+  else:
+    meta["status"] = "idle"
+    meta["statusLabel"] = "Idle"
+
+  extra = count_active_subagents(folder)
+  if meta["status"] == "active":
+    meta["agents"] = 1 + extra
+  else:
+    meta["agents"] = extra
+  return meta
+
+
+def decode_jsonish(raw: Any) -> Any:
+  if isinstance(raw, memoryview):
+    raw = raw.tobytes()
+  if isinstance(raw, bytes):
+    try:
+      text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+      return None
+  elif isinstance(raw, str):
+    text = raw
+  else:
+    return raw if isinstance(raw, (dict, list)) else None
+  stripped = text.strip()
+  if stripped and len(stripped) % 2 == 0 and all(char in "0123456789abcdefABCDEF" for char in stripped):
+    try:
+      return json.loads(bytes.fromhex(stripped).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+      pass
+  try:
+    return json.loads(stripped)
+  except json.JSONDecodeError:
+    return None
+
+
+def cursor_db() -> Any:
+  path = Path.home() / ".config/Cursor/User/globalStorage/state.vscdb"
+  if not path.is_file():
+    return None
+  try:
+    import sqlite3
+
+    database = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=0.4)
+    database.execute("PRAGMA query_only = ON")
+    return database
+  except Exception:
+    return None
+
+
+def workspace_path(value: Any) -> str:
+  if not isinstance(value, dict):
+    return ""
+  ident = value.get("workspaceIdentifier") or value.get("workspace") or {}
+  if isinstance(ident, dict):
+    uri = ident.get("uri") if isinstance(ident.get("uri"), dict) else ident
+    for key in ("fsPath", "path"):
+      candidate = uri.get(key) if isinstance(uri, dict) else None
+      if isinstance(candidate, str) and candidate.startswith("/"):
+        return candidate
+  location = value.get("agentLocation")
+  if isinstance(location, dict):
+    env = location.get("environment")
+    if isinstance(env, dict):
+      uri = env.get("uri")
+      if isinstance(uri, dict):
+        candidate = uri.get("fsPath") or uri.get("path")
+        if isinstance(candidate, str) and candidate.startswith("/"):
+          return candidate
+  return ""
+
+
+def cursor_windows(clients: list[dict[str, Any]]) -> list[dict[str, Any]]:
+  matches = []
+  for client in clients:
+    klass = str(client.get("class") or client.get("initialClass") or "").lower()
+    if klass == "cursor":
+      matches.append(client)
+  return matches
+
+
+def window_for_cursor(cwd: str, clients: list[dict[str, Any]]) -> dict[str, Any] | None:
+  windows = cursor_windows(clients)
+  name = Path(cwd).name.lower() if cwd else ""
+  if name:
+    for window in windows:
+      title = str(window.get("title") or "").lower()
+      if name in title and "agents" not in title:
+        return window
+  for window in windows:
+    if str(window.get("title") or "") == "Cursor Agents":
+      return window
+  return windows[0] if windows else None
+
+
+def cursor_status(header: dict[str, Any], data: dict[str, Any]) -> tuple[str, str, int]:
+  raw = str(data.get("status") or header.get("status") or "").lower()
+  generating = bool(data.get("generatingBubbleIds"))
+  unfinished = bool(data.get("unfinishedRunAt") or header.get("unfinishedRunAt"))
+  blocking = bool(data.get("hasBlockingPendingActions") or header.get("hasBlockingPendingActions"))
+  location = header.get("agentLocation") if isinstance(header.get("agentLocation"), dict) else {}
+  location_active = str(location.get("status") or "") == "active"
+  extras = 0
+  for key in ("subagentComposerIds", "subComposerIds"):
+    value = data.get(key) or header.get(key) or []
+    if isinstance(value, list):
+      extras += len(value)
+  if blocking or header.get("hasPendingPlan"):
+    return "waiting", "Waiting", extras
+  # Cursor often leaves status="aborted" on a still-running turn.
+  if generating or unfinished or raw in ("generating", "running", "in_progress"):
+    return "active", "Active", 1 + extras
+  if location_active and raw in ("generating", "running", "in_progress", ""):
+    return "active", "Active", 1 + extras
+  if raw in ("failed", "error"):
+    return "error", "Error", extras
+  return "idle", "Idle", extras
+
+
+def real_cursor_agent(header: dict[str, Any], data: dict[str, Any]) -> bool:
+  if header.get("isDraft") or header.get("isArchived") or header.get("isSubagent"):
+    return False
+  if header.get("isEphemeral"):
+    return False
+  mode = str(data.get("unifiedMode") or header.get("unifiedMode") or "")
+  if mode and mode != "agent":
+    return False
+  name = str(data.get("name") or header.get("name") or "").strip()
+  tokens = data.get("contextTokensUsed")
+  used = bool(name) or bool(tokens) or bool(data.get("unfinishedRunAt") or header.get("unfinishedRunAt"))
+  used = used or bool(data.get("status") not in (None, "", "none"))
+  used = used or bool(header.get("contextUsagePercent"))
+  if not used:
+    return False
+  cwd = workspace_path(header) or workspace_path(data)
+  composer_id = str(header.get("composerId") or data.get("composerId") or "")
+  if composer_id in {"empty-state-draft"}:
+    return False
+  if not cwd and not name:
+    return False
+  return True
+
+
+def list_cursor_sessions(clients: list[dict[str, Any]]) -> list[dict[str, Any]]:
+  database = cursor_db()
+  if database is None:
+    return []
+  headers: dict[str, dict[str, Any]] = {}
+  bodies: dict[str, dict[str, Any]] = {}
+  try:
+    try:
+      for composer_id, recency, raw in database.execute(
+        "SELECT composerId, recency, value FROM composerHeaders "
+        "WHERE COALESCE(isArchived, 0) = 0 AND COALESCE(isSubagent, 0) = 0"
+      ):
+        value = decode_jsonish(raw)
+        if not isinstance(value, dict):
+          continue
+        value["composerId"] = str(composer_id)
+        value["_recency"] = int(recency or 0)
+        headers[str(composer_id)] = value
+    except Exception:
+      pass
+    try:
+      for key, raw in database.execute("SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%'"):
+        composer_id = str(key).split(":", 1)[-1]
+        value = decode_jsonish(raw)
+        if isinstance(value, dict):
+          bodies[composer_id] = value
+    except Exception:
+      pass
+  finally:
+    try:
+      database.close()
+    except Exception:
+      pass
+
+  hidden = trashed_ids("cursor")
+  sessions = []
+  ids = list(dict.fromkeys([*headers.keys(), *bodies.keys()]))
+  for composer_id in ids:
+    if composer_id in hidden:
+      continue
+    header = headers.get(composer_id) or {}
+    data = bodies.get(composer_id) or {}
+    if not real_cursor_agent(header, data):
+      continue
+    cwd = workspace_path(header) or workspace_path(data)
+    title = str(data.get("name") or header.get("name") or "").strip()
+    if not title:
+      title = Path(cwd).name if cwd else composer_id[:8]
+    usage = context_fields(
+      data.get("contextTokensUsed") or header.get("contextTokensUsed"),
+      data.get("contextTokenLimit") or header.get("contextTokenLimit"),
+      data.get("contextUsagePercent")
+      if data.get("contextUsagePercent") is not None
+      else header.get("contextUsagePercent"),
+    )
+    status, status_label, agents = cursor_status(header, data)
+    model = ""
+    config = data.get("modelConfig")
+    if isinstance(config, dict):
+      model = str(config.get("modelName") or "")
+    window = window_for_cursor(cwd, clients)
+    window_title = str((window or {}).get("title") or "")
+    recency = int(header.get("_recency") or data.get("lastUpdatedAt") or header.get("lastUpdatedAt") or 0)
+    sessions.append(
+      {
+        "id": composer_id,
+        "provider": "cursor",
+        "pid": int((window or {}).get("pid") or 0),
+        "cwd": cwd,
+        "cwdName": Path(cwd).name if cwd else "",
+        "title": title,
+        "model": model,
+        "agents": agents,
+        "tokens": usage["tokens"],
+        "tokensLabel": usage["tokensLabel"],
+        "contextLimit": usage["contextLimit"],
+        "contextPercent": usage["contextPercent"],
+        "contextLabel": usage["contextLabel"],
+        "status": status,
+        "statusLabel": status_label,
+        "windowAddress": str((window or {}).get("address") or ""),
+        "windowTitle": window_title,
+        "_recency": recency,
+      }
+    )
+
+  sessions.sort(key=lambda row: (0 if row["status"] == "active" else 1, -int(row.get("_recency") or 0)))
+  for row in sessions:
+    row.pop("_recency", None)
+  return sessions[:15]
+
+
+def grok_sessions(clients: list[dict[str, Any]]) -> list[dict[str, Any]]:
+  home = grok_home()
+  raw = read_json(home / "active_sessions.json")
+  entries = raw if isinstance(raw, list) else []
+  sessions = []
+
+  for entry in entries:
+    if not isinstance(entry, dict):
+      continue
+    try:
+      pid = int(entry.get("pid") or 0)
+    except Exception:
+      pid = 0
+    if not pid_alive(pid):
+      continue
+    session_id = str(entry.get("session_id") or "")
+    cwd = str(entry.get("cwd") or "")
+    folder = session_dir(home, session_id, cwd)
+    window = window_for_pid(pid, clients)
+    window_title = str((window or {}).get("title") or "")
+    meta = session_meta(folder, pid, window_title)
+    agents = int(meta["agents"])
+    sessions.append(
+      {
+        "id": session_id,
+        "provider": "grok",
+        "pid": pid,
+        "cwd": cwd,
+        "cwdName": Path(cwd).name or cwd,
+        "title": meta["title"] or "New session",
+        "model": meta["model"],
+        "agents": agents,
+        "tokens": meta["tokens"],
+        "tokensLabel": meta["tokensLabel"],
+        "contextLimit": meta["contextLimit"],
+        "contextPercent": meta["contextPercent"],
+        "contextLabel": meta["contextLabel"],
+        "status": meta["status"],
+        "statusLabel": meta["statusLabel"],
+        "windowAddress": str((window or {}).get("address") or ""),
+        "windowTitle": window_title,
+        "stub": bool(meta.get("stub")),
+      }
+    )
+
+  real_pids = {int(row.get("pid") or 0) for row in sessions if not row.get("stub")}
+  kept = []
+  for row in sessions:
+    if row.get("stub") and int(row.get("pid") or 0) in real_pids:
+      continue
+    row.pop("stub", None)
+    kept.append(row)
+  return kept
+
+
+def trashed_path() -> Path:
+  current = Path.home() / ".local/state/omarchy/io.github.hwpaige.grok-bar/trashed.json"
+  if current.exists():
+    return current
+  legacy = Path.home() / ".local/state/omarchy/grok.bar/trashed.json"
+  return current if not legacy.exists() else legacy
+
+
+def trashed_ids(provider: str) -> set[str]:
+  raw = read_json(trashed_path())
+  if not isinstance(raw, dict):
+    return set()
+  rows = raw.get(provider) or []
+  return {str(item) for item in rows} if isinstance(rows, list) else set()
+
+
+def mark_trashed(provider: str, session_id: str) -> None:
+  dest = Path.home() / ".local/state/omarchy/io.github.hwpaige.grok-bar/trashed.json"
+  dest.parent.mkdir(parents=True, exist_ok=True)
+  raw = read_json(trashed_path())
+  data = raw if isinstance(raw, dict) else {}
+  rows = [str(item) for item in (data.get(provider) or [])] if isinstance(data.get(provider), list) else []
+  if session_id not in rows:
+    rows.append(session_id)
+  data[provider] = rows[-80:]
+  dest.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
+def grok_bin() -> str | None:
+  env = os.environ.get("OMARCHY_GROK_BIN")
+  if env and Path(env).is_file() and os.access(env, os.X_OK):
+    return env
+  here = Path(__file__).resolve()
+  for cand in (
+    Path.home() / ".grok/bin/grok",
+    Path("/usr/bin/grok"),
+  ):
+    if cand.is_file() and os.access(cand, os.X_OK) and cand.resolve() != here:
+      return str(cand)
+  return None
+
+
+def prune_active_sessions(session_id: str) -> None:
+  path = grok_home() / "active_sessions.json"
+  raw = read_json(path)
+  if not isinstance(raw, list):
+    return
+  kept = [row for row in raw if not (isinstance(row, dict) and str(row.get("session_id") or "") == session_id)]
+  if len(kept) != len(raw):
+    path.write_text(json.dumps(kept, indent=2) + "\n", encoding="utf-8")
+
+
+def close_window(address: str) -> None:
+  if not address:
+    return
+  for args in (
+    ["hyprctl", "dispatch", f'hl.dsp.close({{ window = "address:{address}" }})'],
+    ["hyprctl", "dispatch", "closewindow", f"address:{address}"],
+  ):
+    try:
+      subprocess.run(args, check=False, timeout=2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+      return
+    except Exception:
+      continue
+
+
+def trash_to_gio(path: Path) -> bool:
+  if not path.exists():
+    return False
+  try:
+    result = subprocess.run(
+      ["gio", "trash", str(path)],
+      check=False,
+      timeout=5,
+      stdout=subprocess.DEVNULL,
+      stderr=subprocess.DEVNULL,
+    )
+    return result.returncode == 0
+  except Exception:
+    return False
+
+
+def trash_grok(session_id: str) -> dict[str, Any]:
+  clients = hypr_clients()
+  rows = grok_sessions(clients)
+  hit = next((row for row in rows if row.get("id") == session_id), None)
+  others = [row for row in rows if row.get("id") != session_id]
+  pid = int((hit or {}).get("pid") or 0)
+  address = str((hit or {}).get("windowAddress") or "")
+  cwd = str((hit or {}).get("cwd") or "")
+  folder = session_dir(grok_home(), session_id, cwd)
+  binary = grok_bin()
+  deleted = False
+  if binary:
+    try:
+      result = subprocess.run(
+        [binary, "sessions", "delete", session_id],
+        check=False,
+        timeout=12,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+      )
+      deleted = result.returncode == 0
+    except Exception:
+      deleted = False
+  if folder and folder.exists():
+    trash_to_gio(folder)
+  prune_active_sessions(session_id)
+  if address and pid and all(int(row.get("pid") or 0) != pid for row in others):
+    close_window(address)
+  return {"ok": True, "id": session_id, "provider": "grok", "deleted": deleted}
+
+
+def trash_cursor(session_id: str) -> dict[str, Any]:
+  mark_trashed("cursor", session_id)
+  path = Path.home() / ".config/Cursor/User/globalStorage/state.vscdb"
+  archived = False
+  if path.is_file():
+    try:
+      import sqlite3
+
+      database = sqlite3.connect(str(path), timeout=1.0)
+      try:
+        row = database.execute(
+          "SELECT value FROM composerHeaders WHERE composerId=?", (session_id,)
+        ).fetchone()
+        value = decode_jsonish(row[0]) if row else {}
+        if not isinstance(value, dict):
+          value = {}
+        value["isArchived"] = True
+        database.execute(
+          "UPDATE composerHeaders SET isArchived=1, value=? WHERE composerId=?",
+          (json.dumps(value, separators=(",", ":")), session_id),
+        )
+        database.commit()
+        archived = True
+      finally:
+        database.close()
+    except Exception:
+      archived = False
+  return {"ok": True, "id": session_id, "provider": "cursor", "archived": archived}
+
+
+def find_session(session_id: str) -> dict[str, Any] | None:
+  clients = hypr_clients()
+  for row in grok_sessions(clients) + list_cursor_sessions(clients):
+    if row.get("id") == session_id:
+      return row
+  return None
+
+
+def trash_session(session_id: str) -> dict[str, Any]:
+  if not session_id:
+    return {"ok": False, "error": "missing session id"}
+  row = find_session(session_id)
+  provider = str((row or {}).get("provider") or "")
+  if provider == "cursor":
+    return trash_cursor(session_id)
+  if provider == "grok":
+    return trash_grok(session_id)
+  grok_result = trash_grok(session_id)
+  if grok_result.get("deleted"):
+    return grok_result
+  return trash_cursor(session_id)
+
+
+def main() -> int:
+  if len(sys.argv) >= 3 and sys.argv[1] == "--trash":
+    print(json.dumps(trash_session(sys.argv[2]), separators=(",", ":")))
+    return 0
+  if len(sys.argv) > 1 and sys.argv[1] in {"-h", "--help"}:
+    print("Usage: omarchy-grok-sessions [--trash <session-id>]")
+    return 0
+  clients = hypr_clients()
+  grok = grok_sessions(clients)
+  cursor = list_cursor_sessions(clients)
+  grok_agents = sum(int(row.get("agents") or 0) for row in grok)
+  cursor_agents = sum(int(row.get("agents") or 0) for row in cursor)
+  print(
+    json.dumps(
+      {
+        "runningSessions": len(grok) + len(cursor),
+        "runningAgents": grok_agents + cursor_agents,
+        "grokSessions": grok,
+        "cursorSessions": cursor,
+        "sessions": grok + cursor,
+      },
+      separators=(",", ":"),
+    )
+  )
+  return 0
+
+
+if __name__ == "__main__":
+  raise SystemExit(main())

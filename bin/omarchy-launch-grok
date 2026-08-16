@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# omarchy:summary=Launch or focus a Grok session in a zero-padding terminal
+# omarchy:args=[--new|--focus <session-id>]
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HOME_DIR="${HOME:?}"
+
+mode="new"
+session_id=""
+
+while (($#)); do
+  case "$1" in
+    --new) mode="new"; shift ;;
+    --focus)
+      mode="focus"
+      session_id="${2:?--focus needs a session id}"
+      shift 2
+      ;;
+    *)
+      echo "Usage: omarchy-launch-grok [--new|--focus <session-id>]" >&2
+      exit 2
+      ;;
+  esac
+done
+
+default_cwd() {
+  if [[ -d $HOME_DIR/Projects ]]; then
+    echo "$HOME_DIR/Projects"
+  elif [[ -d $HOME_DIR/Work ]]; then
+    echo "$HOME_DIR/Work"
+  else
+    echo "$HOME_DIR"
+  fi
+}
+
+focus_window() {
+  local address="$1"
+  [[ -n $address ]] || return 1
+  hyprctl dispatch "hl.dsp.focus({ window = \"address:$address\" })" >/dev/null 2>&1 \
+    || hyprctl dispatch focuswindow "address:$address" >/dev/null 2>&1
+}
+
+lookup_session() {
+  python3 -c 'import json,sys
+d=json.loads(sys.argv[1]); sid=sys.argv[2]; field=sys.argv[3]
+rows=(d.get("sessions") or []) + (d.get("grokSessions") or []) + (d.get("cursorSessions") or [])
+hit=next((s for s in rows if s.get("id")==sid), {})
+print(hit.get(field) or "")' "$1" "$2" "$3"
+}
+
+if [[ $mode == "focus" ]]; then
+  data="$(omarchy-grok-sessions 2>/dev/null || true)"
+  address=""
+  cwd=""
+  provider=""
+  if [[ -n $data ]]; then
+    address="$(lookup_session "$data" "$session_id" windowAddress)"
+    cwd="$(lookup_session "$data" "$session_id" cwd)"
+    provider="$(lookup_session "$data" "$session_id" provider)"
+  fi
+  if [[ -n $address ]] && focus_window "$address"; then
+    exit 0
+  fi
+  if [[ $provider == "cursor" ]]; then
+    if [[ -n $cwd && -d $cwd ]] && command -v cursor >/dev/null 2>&1; then
+      exec cursor --reuse-window "$cwd"
+    fi
+    if command -v cursor >/dev/null 2>&1; then
+      exec cursor
+    fi
+    exit 1
+  fi
+fi
+
+cwd="${cwd:-$(default_cwd)}"
+[[ -d $cwd ]] || cwd="$(default_cwd)"
+
+if [[ $mode == "focus" && -n $session_id ]]; then
+  exec "$SCRIPT_DIR/omarchy-grok-term" --cwd "$cwd" -- --resume "$session_id" --permission-mode bypassPermissions
+fi
+
+exec "$SCRIPT_DIR/omarchy-grok-term" --cwd "$cwd" -- --permission-mode bypassPermissions

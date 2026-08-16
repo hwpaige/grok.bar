@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# omarchy:summary=Run Grok in a zero-padding terminal window
+# omarchy:args=[--cwd <dir>] [--] [grok-args...]
+
+set -euo pipefail
+
+HOME_DIR="${HOME:?}"
+APP_ID="org.omarchy.grok"
+FOOT_CONF="${HOME_DIR}/.config/foot/grok.ini"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+real_grok() {
+  local self cand
+  self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+  if [[ -n ${OMARCHY_GROK_BIN:-} && -x $OMARCHY_GROK_BIN ]]; then
+    echo "$OMARCHY_GROK_BIN"
+    return
+  fi
+  IFS=: read -ra dirs <<<"${PATH:-}"
+  for dir in "${dirs[@]}"; do
+    cand="${dir}/grok"
+    [[ -x $cand ]] || continue
+    if [[ $(readlink -f "$cand" 2>/dev/null || echo "$cand") == "$self" ]]; then
+      continue
+    fi
+    # Skip this plugin's own grok wrapper.
+    if [[ $(readlink -f "$cand" 2>/dev/null || true) == "$(readlink -f "$SCRIPT_DIR/grok" 2>/dev/null || true)" ]]; then
+      continue
+    fi
+    echo "$cand"
+    return
+  done
+  for cand in "$HOME_DIR/.grok/bin/grok" /usr/bin/grok; do
+    [[ -x $cand ]] && echo "$cand" && return
+  done
+  return 1
+}
+
+GROK_BIN="$(real_grok || true)"
+if [[ -z ${GROK_BIN:-} ]]; then
+  echo "grok is not installed" >&2
+  exit 1
+fi
+
+cwd="$PWD"
+if [[ ${1:-} == --cwd ]]; then
+  cwd="${2:?--cwd needs a directory}"
+  shift 2
+fi
+[[ ${1:-} == -- ]] && shift
+[[ -d $cwd ]] || cwd="$HOME_DIR"
+
+terminal="$(xdg-terminal-exec --print-id 2>/dev/null || true)"
+
+run() {
+  exec setsid uwsm-app -- env GROK_PADLESS=1 OMARCHY_GROK_BIN="$GROK_BIN" "$@"
+}
+
+case $terminal in
+  *foot*)
+    run foot --app-id="$APP_ID" --config="$FOOT_CONF" --working-directory="$cwd" -e "$GROK_BIN" "$@"
+    ;;
+  *Alacritty*)
+    run alacritty --class="$APP_ID" --working-directory="$cwd" \
+      -o 'window.padding.x=0' -o 'window.padding.y=0' \
+      -e "$GROK_BIN" "$@"
+    ;;
+  *kitty*)
+    run kitty --class="$APP_ID" --directory="$cwd" \
+      --override window_padding_width=0 \
+      "$GROK_BIN" "$@"
+    ;;
+  *ghostty*)
+    run ghostty --class="$APP_ID" --working-directory="$cwd" \
+      --window-padding-x=0 --window-padding-y=0 \
+      -e "$GROK_BIN" "$@"
+    ;;
+  *)
+    run xdg-terminal-exec --app-id="$APP_ID" --dir="$cwd" -e "$GROK_BIN" "$@"
+    ;;
+esac
