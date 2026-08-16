@@ -130,7 +130,7 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(Style.space(360))
+    contentWidth: panel.fittedContentWidth(Style.space(420))
     contentHeight: panel.fittedContentHeight(column.implicitHeight)
 
     PanelKeyCatcher {
@@ -318,7 +318,7 @@ Panel {
       Column {
         id: labels
         anchors.verticalCenter: parent.verticalCenter
-        width: parent.width - Style.space(28) - trashBtn.size - Style.space(6)
+        width: parent.width - trashBtn.size - Style.space(22)
         spacing: 2
 
         Item {
