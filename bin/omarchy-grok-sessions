@@ -372,43 +372,93 @@ def window_for_cursor(cwd: str, clients: list[dict[str, Any]]) -> dict[str, Any]
   return windows[0] if windows else None
 
 
-def cursor_status(header: dict[str, Any], data: dict[str, Any]) -> tuple[str, str, int]:
+def subagent_info(header: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
+  for src in (header, data):
+    info = src.get("subagentInfo")
+    if isinstance(info, dict):
+      return info
+  return {}
+
+
+def is_cursor_subagent(header: dict[str, Any], data: dict[str, Any]) -> bool:
+  if header.get("isSubagent") or data.get("isSubagent"):
+    return True
+  if header.get("isBestOfNSubcomposer") or data.get("isBestOfNSubcomposer"):
+    return True
+  info = subagent_info(header, data)
+  return bool(info.get("parentComposerId") or info.get("subagentType") is not None or info.get("subagentTypeName"))
+
+
+def cursor_child_ids(header: dict[str, Any], data: dict[str, Any]) -> list[str]:
+  ids: list[str] = []
+  for src in (data, header):
+    for key in ("subagentComposerIds", "subComposerIds"):
+      value = src.get(key) or []
+      if isinstance(value, list):
+        ids.extend(str(item) for item in value if item)
+  return list(dict.fromkeys(ids))
+
+
+def cursor_turn_state(header: dict[str, Any], data: dict[str, Any]) -> str:
   raw = str(data.get("status") or header.get("status") or "").lower()
   generating = bool(data.get("generatingBubbleIds"))
   unfinished = bool(data.get("unfinishedRunAt") or header.get("unfinishedRunAt"))
-  blocking = bool(data.get("hasBlockingPendingActions") or header.get("hasBlockingPendingActions"))
+  blocking = bool(data.get("hasBlockingPendingActions") or header.get("hasBlockingPendingActions") or header.get("hasPendingPlan") or data.get("hasPendingPlan"))
   location = header.get("agentLocation") if isinstance(header.get("agentLocation"), dict) else {}
   location_active = str(location.get("status") or "") == "active"
-  extras = 0
-  for key in ("subagentComposerIds", "subComposerIds"):
-    value = data.get(key) or header.get(key) or []
-    if isinstance(value, list):
-      extras += len(value)
-  if blocking or header.get("hasPendingPlan"):
-    return "waiting", "Waiting", extras
+  if blocking:
+    return "waiting"
   # Cursor often leaves status="aborted" on a still-running turn.
   if generating or unfinished or raw in ("generating", "running", "in_progress"):
-    return "active", "Active", 1 + extras
+    return "active"
   if location_active and raw in ("generating", "running", "in_progress", ""):
-    return "active", "Active", 1 + extras
+    return "active"
   if raw in ("failed", "error"):
-    return "error", "Error", extras
-  return "idle", "Idle", extras
+    return "error"
+  return "idle"
+
+
+def cursor_status(
+  header: dict[str, Any],
+  data: dict[str, Any],
+  children: list[tuple[dict[str, Any], dict[str, Any]]] | None = None,
+) -> tuple[str, str, int]:
+  extras = cursor_child_ids(header, data)
+  child_rows = children or []
+  for child_header, child_data in child_rows:
+    child_id = str(child_header.get("composerId") or child_data.get("composerId") or "")
+    if child_id and child_id not in extras:
+      extras.append(child_id)
+  states = [cursor_turn_state(header, data)]
+  states.extend(cursor_turn_state(child_header, child_data) for child_header, child_data in child_rows)
+  if "waiting" in states:
+    status = "waiting"
+  elif "active" in states:
+    status = "active"
+  elif "error" in states:
+    status = "error"
+  else:
+    status = "idle"
+  labels = {"waiting": "Waiting", "active": "Active", "error": "Error", "idle": "Idle"}
+  agents = len(extras)
+  if agents == 0 and status in ("active", "waiting"):
+    agents = 1
+  return status, labels[status], agents
 
 
 def real_cursor_agent(header: dict[str, Any], data: dict[str, Any]) -> bool:
-  if header.get("isDraft") or header.get("isArchived") or header.get("isSubagent"):
+  if header.get("isDraft") or data.get("isDraft") or header.get("isArchived") or data.get("isArchived"):
     return False
-  if header.get("isEphemeral"):
+  if is_cursor_subagent(header, data):
     return False
-  mode = str(data.get("unifiedMode") or header.get("unifiedMode") or "")
-  if mode and mode != "agent":
+  if header.get("isEphemeral") or data.get("isEphemeral"):
     return False
   name = str(data.get("name") or header.get("name") or "").strip()
-  tokens = data.get("contextTokensUsed")
+  tokens = data.get("contextTokensUsed") or header.get("contextTokensUsed")
   used = bool(name) or bool(tokens) or bool(data.get("unfinishedRunAt") or header.get("unfinishedRunAt"))
   used = used or bool(data.get("status") not in (None, "", "none"))
-  used = used or bool(header.get("contextUsagePercent"))
+  used = used or bool(header.get("contextUsagePercent") or data.get("contextUsagePercent"))
+  used = used or bool(cursor_child_ids(header, data))
   if not used:
     return False
   cwd = workspace_path(header) or workspace_path(data)
@@ -428,15 +478,17 @@ def list_cursor_sessions(clients: list[dict[str, Any]]) -> list[dict[str, Any]]:
   bodies: dict[str, dict[str, Any]] = {}
   try:
     try:
-      for composer_id, recency, raw in database.execute(
-        "SELECT composerId, recency, value FROM composerHeaders "
-        "WHERE COALESCE(isArchived, 0) = 0 AND COALESCE(isSubagent, 0) = 0"
+      for composer_id, recency, is_subagent, raw in database.execute(
+        "SELECT composerId, recency, isSubagent, value FROM composerHeaders "
+        "WHERE COALESCE(isArchived, 0) = 0"
       ):
         value = decode_jsonish(raw)
         if not isinstance(value, dict):
           continue
         value["composerId"] = str(composer_id)
         value["_recency"] = int(recency or 0)
+        if is_subagent:
+          value["isSubagent"] = True
         headers[str(composer_id)] = value
     except Exception:
       pass
@@ -453,6 +505,17 @@ def list_cursor_sessions(clients: list[dict[str, Any]]) -> list[dict[str, Any]]:
       database.close()
     except Exception:
       pass
+
+  children_of: dict[str, list[str]] = {}
+  for composer_id, header in headers.items():
+    data = bodies.get(composer_id) or {}
+    parent_id = str(subagent_info(header, data).get("parentComposerId") or "")
+    if parent_id:
+      children_of.setdefault(parent_id, []).append(composer_id)
+    for child_id in cursor_child_ids(header, data):
+      children_of.setdefault(composer_id, []).append(child_id)
+  for parent_id, child_ids in children_of.items():
+    children_of[parent_id] = list(dict.fromkeys(child_ids))
 
   hidden = trashed_ids("cursor")
   sessions = []
@@ -475,7 +538,13 @@ def list_cursor_sessions(clients: list[dict[str, Any]]) -> list[dict[str, Any]]:
       if data.get("contextUsagePercent") is not None
       else header.get("contextUsagePercent"),
     )
-    status, status_label, agents = cursor_status(header, data)
+    child_rows = []
+    for child_id in children_of.get(composer_id) or []:
+      child_header = headers.get(child_id) or {}
+      child_data = bodies.get(child_id) or {}
+      if child_header or child_data:
+        child_rows.append((child_header, child_data))
+    status, status_label, agents = cursor_status(header, data, child_rows)
     model = ""
     config = data.get("modelConfig")
     if isinstance(config, dict):
