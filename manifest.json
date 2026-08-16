@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.hwpaige.grok-bar",
+  "name": "Grok",
+  "version": "1.0.0",
+  "author": "Harrison",
+  "license": "MIT",
+  "description": "Launch Grok and switch between live Grok and Cursor sessions from the bar",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Grok",
+    "description": "Center-bar Grok launcher with live Grok and Cursor sessions",
+    "category": "AI",
+    "allowMultiple": false,
+    "defaultSection": "center"
+  }
+}
